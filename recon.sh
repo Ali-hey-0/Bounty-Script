@@ -1,6 +1,6 @@
 #!/bin/bash
 # ------------------------------------------
-# Ultimate Enterprise Recon Tool
+# Ultimate Enterprise Recon Tool (Enhanced)
 # Author: Ali (Enhanced by AI)
 # Features:
 # - Multi-threaded & optimized
@@ -11,6 +11,7 @@
 # - Sensitive data encryption
 # - Modular design
 # - Auto-update tools
+# - Expanded toolset for broader coverage
 # ------------------------------------------
 
 # Configuration
@@ -47,8 +48,14 @@ declare -A REQUIRED_TOOLS=(
     ["gowitness"]="latest"
     ["rush"]="latest"
     ["jq"]="latest"
-    ["md-to-pdf"]="latest"
+    ["md-to-pdf"]="latest"  # For summary conversion if needed
     ["curl"]="latest"
+    # Non-Go/npm tools assumed to be installed
+    ["sublist3r"]=""
+    ["waybackurls"]=""
+    ["nikto"]=""
+    ["wkhtmltopdf"]=""
+    ["parallel"]=""
 )
 
 # Notify via Slack/Discord
@@ -66,11 +73,11 @@ notify() {
 auto_update_tools() {
     for tool in "${!REQUIRED_TOOLS[@]}"; do
         if ! command -v "$tool" &> /dev/null; then
-            echo -e "${RED}[!] Missing $tool - Installing...${NC}" | tee -a "$LOG_FILE"
+            echo -e "${RED}[!] Missing $tool - Please install it manually if not Go/npm-based${NC}" | tee -a "$LOG_FILE"
             if [[ "$tool" == "md-to-pdf" ]]; then
                 npm install -g md-to-pdf
-            else
-                go install "github.com/projectdiscovery/${tool}/cmd/${tool}@latest"
+            elif [[ ! "$tool" =~ ^(sublist3r|waybackurls|nikto|wkhtmltopdf|parallel)$ ]]; then
+                go install "github.com/projectdiscovery/${tool}/cmd/${tool}@${REQUIRED_TOOLS[$tool]}"
             fi
         fi
     done
@@ -112,6 +119,10 @@ subdomain_enum() {
     subfinder -d "${TARGETS[@]}" -o "$OUTPUT_DIR/subdomains/subfinder.txt" &
     assetfinder --subs-only "${TARGETS[@]}" | tee "$OUTPUT_DIR/subdomains/assetfinder.txt" &
     amass enum -passive -d "${TARGETS[@]}" -o "$OUTPUT_DIR/subdomains/passive.txt" &
+    # Add Sublist3r for broader coverage
+    for domain in "${TARGETS[@]}"; do
+        sublist3r -d "$domain" -o "$OUTPUT_DIR/subdomains/sublist3r_$domain.txt" &
+    done
     wait
     cat "$OUTPUT_DIR/subdomains/"*.txt | sort -u > "$OUTPUT_DIR/subdomains/all.txt"
 }
@@ -122,19 +133,26 @@ url_discovery() {
     cat "$OUTPUT_DIR/subdomains/all.txt" | httpx -silent -threads $THREADS | tee "$OUTPUT_DIR/urls/live_hosts.txt"
     cat "$OUTPUT_DIR/subdomains/all.txt" | gau | uro | tee "$OUTPUT_DIR/urls/historical.txt"
     cat "$OUTPUT_DIR/urls/live_hosts.txt" | katana -jc -kf all -c $THREADS -o "$OUTPUT_DIR/urls/js_endpoints.txt"
+    # Add waybackurls for historical URLs
+    cat "$OUTPUT_DIR/subdomains/all.txt" | waybackurls | tee "$OUTPUT_DIR/urls/wayback.txt"
+    # Merge all URLs
+    cat "$OUTPUT_DIR/urls/"{historical,js_endpoints,wayback}.txt | sort -u > "$OUTPUT_DIR/urls/all_urls.txt"
 }
 
 # Phase 3: Vulnerability Scanning
 vulnerability_scan() {
     echo -e "\n${GREEN}[+] Vulnerability Scanning${NC}" | tee -a "$LOG_FILE"
-    nuclei -list "$OUTPUT_DIR/urls/live_hosts.txt" -t ~/nuclei-templates/ -severity critical,high -rl $THREADS -o "$OUTPUT_DIR/vulns/nuclei_results.txt"
+    # Use JSON output for Nuclei
+    nuclei -list "$OUTPUT_DIR/urls/live_hosts.txt" -t ~/nuclei-templates/ -severity critical,high -rl $THREADS -json -o "$OUTPUT_DIR/vulns/nuclei_results.json"
     cat "$OUTPUT_DIR/urls/historical.txt" | dalfox pipe -b "$BLIND_XSS" -o "$OUTPUT_DIR/vulns/xss_results.txt"
+    # Add Nikto scans on live hosts
+    cat "$OUTPUT_DIR/urls/live_hosts.txt" | parallel -j $THREADS nikto -h {} -output "$OUTPUT_DIR/vulns/nikto_{}.txt"
 }
 
 # Phase 4: Exploit Validation
 validate_findings() {
     echo -e "\n${GREEN}[+] Exploit Validation${NC}" | tee -a "$LOG_FILE"
-    sqlmap -m "$OUTPUT_DIR/vulns/nuclei_results.txt" --batch --dump-all --threads 10
+    sqlmap -m "$OUTPUT_DIR/vulns/nuclei_results.json" --batch --dump-all --threads 10
     nuclei -tags rce -json -o "$OUTPUT_DIR/vulns/rce_verified.json"
     gowitness file -f "$OUTPUT_DIR/urls/live_hosts.txt" -P "$OUTPUT_DIR/screenshots/"
 }
@@ -144,7 +162,6 @@ cve_scan() {
     echo -e "\n${GREEN}[+] CVE-Based Scanning${NC}" | tee -a "$LOG_FILE"
     naabu -list "$OUTPUT_DIR/urls/live_hosts.txt" -o "$OUTPUT_DIR/vulns/open_ports.txt"
     cat "$OUTPUT_DIR/vulns/open_ports.txt" | nuclei -t ~/nuclei-templates/cves/
-    
     # Fetch EPSS scores
     curl -s "$EPSS_API" | jq '.data[] | select(.epss_score > 0.7)' > "$OUTPUT_DIR/vulns/high_risk_cves.txt"
 }
@@ -152,18 +169,31 @@ cve_scan() {
 # Final Report
 generate_report() {
     echo -e "\n${GREEN}[+] Generating Report${NC}" | tee -a "$LOG_FILE"
-    nuclei -json -o - | jq -s '.' | nuclei-reporter -format html -output "$OUTPUT_DIR/report.html"
-    md-to-pdf "$OUTPUT_DIR/report.html" --output "$OUTPUT_DIR/report.pdf"
-    echo -e "\n${GREEN}[+] Report saved to $OUTPUT_DIR/report.pdf${NC}" | tee -a "$LOG_FILE"
-    notify "Recon completed for ${TARGETS[*]}. Report: $OUTPUT_DIR/report.pdf"
+    # Generate HTML report from Nuclei JSON
+    cat "$OUTPUT_DIR/vulns/nuclei_results.json" | nuclei-reporter -format html -output "$OUTPUT_DIR/report.html"
+    # Convert to PDF using wkhtmltopdf
+    wkhtmltopdf "$OUTPUT_DIR/report.html" "$OUTPUT_DIR/report.pdf"
+    # Generate summary
+    echo "Recon Summary for ${TARGETS[*]}" > "$OUTPUT_DIR/summary.txt"
+    echo "-----------------------------" >> "$OUTPUT_DIR/summary.txt"
+    echo "Subdomains found: $(wc -l < "$OUTPUT_DIR/subdomains/all.txt")" >> "$OUTPUT_DIR/summary.txt"
+    echo "Live hosts: $(wc -l < "$OUTPUT_DIR/urls/live_hosts.txt")" >> "$OUTPUT_DIR/summary.txt"
+    echo "URLs discovered: $(wc -l < "$OUTPUT_DIR/urls/all_urls.txt")" >> "$OUTPUT_DIR/summary.txt"
+    echo "Vulnerabilities (Nuclei):" >> "$OUTPUT_DIR/summary.txt"
+    echo "  Critical: $(jq '[.[] | select(.info.severity == "critical")] | length' "$OUTPUT_DIR/vulns/nuclei_results.json")" >> "$OUTPUT_DIR/summary.txt"
+    echo "  High: $(jq '[.[] | select(.info.severity == "high")] | length' "$OUTPUT_DIR/vulns/nuclei_results.json")" >> "$OUTPUT_DIR/summary.txt"
+    echo "XSS findings (Dalfox): $(wc -l < "$OUTPUT_DIR/vulns/xss_results.txt")" >> "$OUTPUT_DIR/summary.txt"
+    echo "Nikto scans performed on live hosts. See vulns/nikto_*.txt for details." >> "$OUTPUT_DIR/summary.txt"
+    echo -e "\n${GREEN}[+] Report saved to $OUTPUT_DIR/report.pdf, Summary at $OUTPUT_DIR/summary.txt${NC}" | tee -a "$LOG_FILE"
+    notify "Recon completed for ${TARGETS[*]}. Report: $OUTPUT_DIR/report.pdf, Summary: $OUTPUT_DIR/summary.txt"
 }
 
 # Cleanup
 cleanup() {
     if [ "$ENCRYPT_DUMPS" = true ]; then
         echo -e "\n${GREEN}[+] Encrypting sensitive data${NC}" | tee -a "$LOG_FILE"
-        gpg --batch --passphrase "$ENCRYPT_KEY" -c "$OUTPUT_DIR/vulns/*.json"
-        shred -u "$OUTPUT_DIR/vulns/*.json" 
+        gpg --batch --passphrase "$ENCRYPT_KEY" -c "$OUTPUT_DIR/vulns/"*.json
+        shred -u "$OUTPUT_DIR/vulns/"*.json
     fi
 }
 
@@ -171,8 +201,8 @@ cleanup() {
 ci_integration() {
     if [[ "$CI_MODE" == "true" ]]; then
         echo -e "\n${GREEN}[+] CI/CD Mode Enabled${NC}" | tee -a "$LOG_FILE"
-        # Add CI/CD-specific logic here (e.g., upload reports to S3, trigger pipelines)
         aws s3 cp "$OUTPUT_DIR/report.pdf" "s3://your-bucket/reports/"
+        aws s3 cp "$OUTPUT_DIR/summary.txt" "s3://your-bucket/reports/"
     fi
 }
 
